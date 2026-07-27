@@ -1,6 +1,7 @@
 {
-  "name": "bookings-app-worker",
+  "name": "bookings-worker",
   "version": "1.0.0",
+  "private": true,
   "type": "module",
   "main": "index.js",
   "scripts": {
@@ -9,9 +10,9 @@
     "start": "node dist/index.js"
   },
   "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": "",
+  "author": "Agustín Tisera",
+  "license": "UNLICENSED",
+  "description": "Proceso persistente de Bookings App: consumers de BullMQ (emails, notificaciones) y servidor socket.io del chat.",
   "devDependencies": {
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^26.1.1",
