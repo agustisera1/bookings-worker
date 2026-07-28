@@ -63,7 +63,7 @@ src/
   redis/
     client.ts           Pub client + `channels` + `publish()` (fan-out de notificaciones a SSE).
     workers.ts          Workers BullMQ (emails, notifications). Conexión por REDIS_URL, autorun:false.
-    socket.ts           Server socket.io + redis-adapter + CORS. Cablea auth y flujo de mensajes del chat.
+    socket.ts           Server socket.io + redis-adapter + CORS. Cablea el handshake (io.use), los joins por ticket (JOIN_CHAT/LEAVE_CHAT) y el message flow.
 
   processors/
     dispatch.ts         `createProcessor`: dispatcher genérico por job map (rutea por processorKey).
@@ -78,8 +78,8 @@ src/
     index.ts            Cliente Mongo (promise singleton).
     listings.mongo.ts   findListingById + ListingDocument
     notifications.mongo.ts  insertNotification + NotificationDocument
-    messages.mongo.ts   insertMessage, findMessagesByChatId + MessageDocument
-    chats.mongo.ts      findChatByBookingId, insertChat + ChatDocument
+    messages.mongo.ts   insertMessage + MessageDocument
+    chats.mongo.ts      findChatByBookingId, upsertChatByBookingId + ChatDocument
 
   notifications/
     content.ts          Tabla de copy por InAppNotificationType (title/body/isRead).
@@ -90,8 +90,8 @@ src/
     greeting-email.ts   `greetingEmailHtml` — mail de bienvenida.
 
   chat/                 Feature socket.io partida por responsabilidad (ver "Partición por módulos").
-    types.ts            ClientMessage, SocketData, AppSocket, mapa `events`; re-exporta MessageDocument.
-    auth.ts             Paso 1 (handshake auth) + paso 2 (authorizeRoom). Hoy STUBS con TODO.
+    types.ts            ClientMessage, SocketData, AppSocket, enum `EVENTS`; re-exporta MessageDocument.
+    auth.ts             verifyToken + authenticateHandshake (paso 1) + authorizeRoom (paso 2); tipos CurrentUser, ChatParties.
     message-flow.ts     Pasos 3–5: emit -> persist -> deliver.
 
   resend.ts             Cliente Resend (singleton).
@@ -213,7 +213,8 @@ realtime del producer).
 - **Redis**: una sola var `REDIS_URL`, leída en cada cliente y **guardada** (`throw if !url`).
 - **PG**: `PGUSER/PGPASSWORD/PGHOST/PGPORT/PGDATABASE`. **Mongo**: `MONGODB_URI`. **Resend**:
   `RESEND_API_KEY`. **Email**: `EMAIL_FROM`, `DEV_MODE`, `DEV_EMAIL_TO`. **Socket**: `SOCKET_PORT`,
-  `CLIENT_ORIGIN`.
+  `CLIENT_ORIGIN`. **Chat auth**: `JWT_SECRET` — el mismo secreto con que el producer firma el JWT del
+  handshake y el ticket de join; `chat/auth.ts` solo verifica con él.
 - Cada cliente (pool PG, promise Mongo, pub client, Resend) es **module-level singleton**: se crea una
   vez al importar el módulo.
 
@@ -246,14 +247,24 @@ responsabilidad** (misma regla que el producer para componentes):
 
 | Archivo | Responsabilidad |
 |---------|-----------------|
-| `chat/types.ts` | Tipos + mapa de `events` compartidos por las piezas. Sin lógica. |
-| `chat/auth.ts` | Autenticación del handshake (paso 1) + autorización de room (paso 2). |
+| `chat/types.ts` | Tipos + enum `EVENTS` compartidos por las piezas. Sin lógica. |
+| `chat/auth.ts` | `verifyToken` + `authenticateHandshake` (paso 1) + `authorizeRoom` (paso 2); tipos `CurrentUser`/`ChatParties`. |
 | `chat/message-flow.ts` | Flujo de mensaje: emit → persist → deliver (pasos 3–5). |
 
-El flujo del chat está numerado en 5 pasos (handshake auth → join/authorize room → emit → persist →
-deliver). **Estado actual:** `authenticateHandshake`, `authorizeRoom` e `insertMessage` son **stubs con
-`TODO`** — el scaffolding está, la verificación de JWT / ownership / persistencia real falta. No asumir
-que el chat está funcional al construir sobre él.
+El chat corre sobre **dos credenciales distintas**, y esa separación es el diseño:
+
+- **Handshake (paso 1) — autentica *quién*.** `io.use(authenticateHandshake)` (`redis/socket.ts`) corre
+  una vez por conexión: verifica el JWT de `socket.handshake.auth.token` con `JWT_SECRET` y cuelga el
+  usuario en `socket.data`. Sin token válido, la conexión se rechaza.
+- **Ticket de join (paso 2) — autoriza *qué*.** El join no viaja en el handshake porque el socket se
+  conecta una vez y el cliente cambia de booking después. El **producer** corre la regla de ownership y
+  firma un `ChatParties` (chat_id + ambas partes + qué lado es el portador); el worker solo verifica la
+  firma y que nombre una parte (`authorizeRoom`) — **sin PG, sin Mongo, sin regla**. La room es el
+  `chat_id` del ticket; las partes verificadas quedan por room en `socket.data.rooms`.
+- **Message flow (pasos 3–5).** Las partes guardadas al join son la autorización. El `sender_id` sale del
+  ticket, nunca del cliente. El documento de chat nace con el primer mensaje (`upsertChatByBookingId`), no
+  con el booking. Se **persiste antes de emitir** (`insertMessage` → broadcast); al emisor se lo excluye
+  del broadcast y recibe el `_id` real por `ack` para reemplazar el temporal que pintó optimista.
 
 ---
 
@@ -268,4 +279,4 @@ que el chat está funcional al construir sobre él.
 - [ ] Persistir **antes** de emitir/publicar. La DB es la fuente de verdad.
 - [ ] Imports relativos con extensión `.js`.
 - [ ] Handler que falla → `throw` (deja que BullMQ reintente); log `[fn]`; sin secretos.
-- [ ] `pnpm build` (`tsc`) verde.
+- [ ] `npm run build` (`tsc`) verde.
