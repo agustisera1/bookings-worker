@@ -4,30 +4,35 @@
 > Mantené una copia idéntica en ambos. Si cambiás el contrato de un payload, actualizás
 > este doc **y** las dos copias en el mismo cambio.
 
-Guía para agregar un nuevo worker o job processor y que quede alineado de los dos lados.
+Guía para agregar un nuevo job processor y que quede alineado de los dos lados.
 Léela completa antes de escribir código de colas.
 
 ---
 
 ## Panorama
 
-Dos procesos, un Redis en el medio:
+**La app ya no encola.** Desde el outbox pattern, el único productor es el relay del worker; Next.js
+solo escribe una fila en Postgres. El porqué está en `docs/insights/OUTBOX_AND_SAGA.md` (repo de la
+app); acá va cómo queda el cableado.
 
-```
-┌─────────────────────────┐        Redis         ┌─────────────────────────┐
-│  Producer (Next.js app)  │      (BullMQ)        │  Worker (proceso aparte) │
-│                          │                      │                          │
-│  service ──▶ Queue.add() │ ──── "emails" ────▶  │  Worker(queue).process() │
-│             (encola job) │      cola nombrada   │ └─▶ dispatch(processorKey)│
-└─────────────────────────┘                      └─────────────────────────┘
+```mermaid
+flowchart LR
+  SA["Server Action<br/>(Next.js)"] -->|"1 · una transacción:<br/>entidad + fila de outbox"| PG[(Postgres)]
+  PG -->|"2 · polling"| R["Relay<br/>(worker)"]
+  R -->|"3 · add()"| Q[["emails / notifications"]]
+  R -->|"4 · published_at"| PG
+  Q -->|5| C["Consumer<br/>(worker)"]
 ```
 
-- El **producer** (esta app) solo **encola**: nunca ejecuta el trabajo pesado (mandar mails, etc.).
-  Hoy encola en dos colas: `emails` y `notifications`.
-- El **worker** (repo aparte) **consume** y ejecuta. Nunca importa nada del producer: los dos lados se
-  hablan **solo** a través del payload JSON que viaja por la cola.
-- Por eso el **payload es el contrato**. No hay tipos compartidos por import; se **replican a mano** en
-  ambos repos (ver [Regla del contrato espejo](#regla-del-contrato-espejo)).
+- La **app** nunca toca Redis en el path de escritura: escribe la entidad y su fila de `outbox` en la
+  misma transacción, y termina. Si Redis está caído, la reserva igual queda con su efecto pendiente.
+- El **relay** (`src/relay.ts`) es el productor: lee las filas sin publicar, las traduce a jobs
+  (`src/outbox/fan-out.ts`) y las encola. Publica y marca; **no** espera al consumer.
+- El **consumer** (`src/processors/*`) ejecuta el trabajo pesado. Se entera por la cola, nunca por el
+  relay.
+
+**Consecuencia para los contratos:** productor y consumer viven ahora en el **mismo repo**, así que los
+`*Payload` dejaron de estar duplicados. La fuente única es `src/events.ts` del worker.
 
 ---
 
@@ -36,15 +41,17 @@ Dos procesos, un Redis en el medio:
 Un payload cruza un boundary de proceso y se **serializa a JSON** en Redis. Por lo tanto:
 
 1. **Mínimo.** Solo los campos que el consumer realmente usa. Nada de filas de DB completas ni
-   documentos enteros “por las dudas”.
+   documentos enteros "por las dudas".
 2. **Sin secretos ni PII de más.** Jamás `password_hash`, tokens, ni el `User` completo. Si necesitás el
    host, mandá `{ name }`, no el row.
 3. **JSON-safe.** Nada de `Date`, `ObjectId`, `Buffer`, clases. **Las fechas van como ISO string**
    (`new Date(x).toISOString()`), porque es lo único que sobrevive el transporte de forma honesta.
 4. **Autodescriptivo.** El payload trae `processorKey` (ver abajo) para que el worker sepa qué hacer sin
    inspeccionar el resto.
-5. **Un tipo, un mapper.** El producer define el `type ...Payload` **y** una función pura
-   `to...Payload(...)` que hace el narrowing desde el dominio. El narrowing vive en un solo lugar.
+
+> **La fila de outbox tiene su propia regla, y es la opuesta:** es *thin* — sólo ids. El payload rico se
+> arma en el relay, al publicar. Meter el payload de la cola dentro de la fila congelaría el contrato
+> dentro de Postgres, y las filas viejas quedarían con el contrato viejo.
 
 ---
 
@@ -52,120 +59,96 @@ Un payload cruza un boundary de proceso y se **serializa a JSON** en Redis. Por 
 
 ### Conexión a Redis
 
-Los dos procesos apuntan al mismo Redis, pero **cada lado arma la conexión distinto** — no comparten
-helper ni las mismas env vars:
-
-- **Producer (esta app):** cuatro vars discretas — `REDIS_HOST`, `REDIS_PORT`, `REDIS_USER`,
-  `REDIS_PASSWORD` — validadas una sola vez por `getRedisConnectionParams()` en `lib/redis-config.ts`
-  (tira si falta alguna). BullMQ las consume a nivel top-level; el subscriber SSE (`lib/subscriber.ts`)
-  las anida bajo `socket`.
-- **Worker (repo aparte):** una sola var `REDIS_URL`, leída directo en cada cliente
-  (`src/redis/workers.ts`, `src/redis/client.ts`, `src/redis/socket.ts`). No replica el helper del producer.
+- **Worker:** una sola var `REDIS_URL`, leída directo en cada cliente (`src/redis/workers.ts`,
+  `src/redis/queues.ts`, `src/redis/client.ts`, `src/redis/socket.ts`).
+- **App:** ya no conecta a Redis para colas. `getRedisConnectionParams()` (`lib/redis-config.ts`) sigue
+  vivo para el subscriber SSE (`lib/subscriber.ts`) y la cota de abuso (`lib/redis.ts`).
 
 ### Nombres de cola
 
 - Una cola = una **familia de trabajo**, no un job puntual. Ej: `"emails"` agrupa todos los mails
-  (booking pending, booking accepted, review recibida…); `"notifications"` agrupa las notificaciones in-app.
-- El string del nombre de cola es literal y **tiene que ser idéntico** en `new Queue("emails")` (producer)
-  y `new Worker("emails")` (worker).
+  (booking pending, booking accepted…); `"notifications"` agrupa las notificaciones in-app.
+- El string es literal y **tiene que ser idéntico** en `new Queue("emails")` (`src/redis/queues.ts`) y
+  `new Worker("emails")` (`src/redis/workers.ts`).
 
 ### `processorKey` — ruteo dentro de una cola
 
 Una cola transporta **varios tipos de job**. El discriminante es `processorKey` dentro del payload; el
 worker rutea con un **job map** (`Record<processorKey, handler>`) sobre ese campo. El nombre de job de
-BullMQ (`queue.add(name, data)`) **no** se usa para rutear hoy — el ruteo es siempre por `processorKey`.
+BullMQ (`queue.add(name, data)`) **no** se usa para rutear.
 
-`processorKey` se tipa como **literal** (`"notify-booking"`), no como `string`, para que el job map del
-worker se indexe por esos literales; si llega un `processorKey` sin handler, el dispatcher tira (y BullMQ
+`processorKey` se tipa como **literal** (`"notify-booking"`), no como `string`, para que el job map se
+indexe por esos literales; si llega un `processorKey` sin handler, el dispatcher tira (y BullMQ
 reintenta).
 
 **`processorKey` vs. una variación del mismo trabajo.** El `processorKey` distingue *trabajos distintos*
 (mandar un mail vs. sincronizar a Elasticsearch). Variaciones del **mismo** trabajo — misma plantilla,
 distinta copy según el estado — **no** son un `processorKey` nuevo: van con un campo discriminante en el
-payload. Ej.: los mails `pending` / `approved` / `rejected` / `updated` / `cancelled` son todos el mismo
-`notify-booking` con distinto `type`, no cinco processors. Un `processorKey` nuevo solo se justifica si el
-worker haría algo estructuralmente distinto.
+payload. Ej.: los mails `pending` / `approved` / `rejected` / `cancelled` son todos el mismo
+`notify-booking` con distinto `type`, no cuatro processors.
 
 ---
 
 ## Cómo se ve hoy (referencia canónica: email de reserva)
 
-### Producer — `lib/events.ts`
+### App — la escritura y su fila
+
+El service decide el `event_type` (es vocabulario de dominio); el repo lo escribe en la misma
+transacción que la entidad, con un CTE:
 
 ```ts
-const connection = getRedisConnectionParams();
-
-// Política de entrega compartida por las dos colas. Vive en el producer porque
-// las opciones viajan CON el job a Redis: un restart del worker no cambia la
-// política de un job ya encolado.
-const defaultJobOptions: JobsOptions = {
-  attempts: 3,
-  backoff: { type: "exponential", delay: 5000 },
-  removeOnComplete: 1000,  // counts, no booleanos: `true` no deja nada que inspeccionar
-  removeOnFail: 5000,
-};
-
-export const emailQueue = new Queue("emails", { connection, defaultJobOptions });
-export const notificationsQueue = new Queue("notifications", { connection, defaultJobOptions });
-
-// El contrato: mínimo, JSON-safe, sin secretos.
-// Un solo processorKey cubre todos los mails de reserva; `type` elige la copy.
-export type NotificationType = "pending" | "approved" | "rejected" | "updated" | "cancelled";
-export type BookingEmailPayload = {
-  processorKey: "notify-booking";
-  type: NotificationType;
-  guest: { email: string };
-  // `statusReason` / `refundAmount` / `cancelledBy` solo significan algo en `cancelled`.
-  booking: {
-    id: string; checkIn: string; checkOut: string; guests: number; totalPrice: number;
-    statusReason?: string; refundAmount?: number; cancelledBy?: "guest" | "host";
-  };
-  host: { name: string };
-  listing: { title: string; location: { address?: string; city?: string; country?: string } };
-};
-
-// El mapper puro: único lugar que decide qué campos van al email.
-export function toBookingEmailPayload(input: { ... }): BookingEmailPayload { ... }
+// lib/services/bookings.ts
+await bookingsRepo.updateBooking(
+  bookingId,
+  { status: "accepted" },
+  { type: "booking.accepted", payload: { listingId, guestId } },
+);
 ```
 
-### Producer — `lib/services/bookings.ts`
+Los `OutboxEventType` válidos viven en `lib/types/outbox.ts`. **Agregar uno obliga a enseñárselo al
+`toJobs` del worker**: un tipo que no conoce se descarta con un log.
+
+### Worker — el fan-out (`src/outbox/fan-out.ts`)
+
+Un evento de dominio se abre en N jobs. Como la fila es thin, acá se rehidrata todo lo que los payloads
+renderizan:
 
 ```ts
-// El service junta el dominio, guarda contra datos faltantes y encola el payload narrowed.
-async function emailBookingDetails(bookingDetails: EmailBookingParams): Promise<ServiceResult<Job>> {
-  const { guestEmail, booking, host, listing } = bookingDetails;
-  if (!host || !listing) { /* log + return NOT_FOUND: no encolar un job roto */ }
-  try {
-    // `jobId` determinístico: nombra el hecho, no la invocación. Ver § Idempotencia.
-    const job = await emailQueue.add(
-      "emails",
-      toBookingEmailPayload({ guestEmail, booking, host, listing }),
-      { jobId: `booking-${booking.id}-${type}` },
-    );
-    return { ok: true, data: job };
-  } catch (error) { /* log + ServiceResult UNEXPECTED */ }
-}
+const BOOKING_EVENTS = {
+  "booking.created":  { email: "pending",  notify: "notify_user",           recipient: "host" },
+  "booking.accepted": { email: "approved", notify: "notify_booking_update", recipient: "guest" },
+  // …
+};
+
+// `null` = la fila no se va a poder publicar nunca (tipo desconocido, o el agregado ya no está).
+// El relay la marca igual: sin eso, una fila podrida se reintenta en cada tick para siempre.
+export async function toJobs(event: Outbox): Promise<QueuedJob[] | null>;
 ```
 
-### Worker (repo aparte)
+### Worker — el relay (`src/relay.ts`)
+
+```ts
+const jobs = await toJobs(event);
+for (const job of jobs ?? []) await queues[job.queue].add(job.queue, job.data, job.opts);
+// Recién ahora. Si un add() tira, la fila queda pendiente y el próximo tick la reintenta.
+await outboxRepo.markAsPublished(event.id);
+```
+
+`published_at` responde *"¿se entregó a la cola?"*, no *"¿se mandó el mail?"*. Cuando el `add` retorna,
+BullMQ ya persistió el job y se hace cargo de reintentarlo.
+
+### Worker — el consumer
 
 ```ts
 // Un Worker por cola. `createProcessor` (src/processors/dispatch.ts) busca el handler por
-// processorKey en el job map de esa cola; si no existe —o si el handler tira— re-lanza para
-// que BullMQ marque el job fallido y lo reintente. Los workers se crean con `autorun: false`
-// y se arrancan explícitamente en el bootstrap (src/index.ts).
+// processorKey; si no existe —o si el handler tira— re-lanza para que BullMQ reintente.
+// Los workers se crean con `autorun: false` y se arrancan en el bootstrap (src/index.ts).
 export const emailsWorker = new Worker("emails", emailsProcessor, { connection, autorun: false });
 
-// El job map de la cola "emails": processorKey -> handler.
 const emailsProcessor = createProcessor("emailsProcessor", {
   "greet-user": greetUser,
   "notify-booking": notifyBooking,
 });
-
-async function notifyBooking(job: Job) {
-  const payload = job.data as BookingPayload; // type replicado en este repo (src/events.ts)
-  await resend.emails.send({ to: [payload.guest.email], html: bookingEmailHtml(payload, payload.type), ... });
-}
 ```
 
 ---
@@ -176,46 +159,45 @@ Tomá una decisión primero: **¿entra en una cola existente o necesita una nuev
 Misma familia de trabajo (otro tipo de mail) → cola existente, nuevo `processorKey`.
 Familia distinta con distinto perfil de retry/concurrencia (ej. sync a Elasticsearch) → cola nueva.
 
-### En el producer (esta app)
+### En la app
 
-1. **Definí el contrato** en `lib/events.ts`: `type XxxPayload` con `processorKey: "xxx"` literal,
-   mínimo y JSON-safe (fechas ISO).
-2. **Definí el mapper** `toXxxPayload(input): XxxPayload` — puro, sin I/O, único lugar de narrowing.
-3. **Cola:** reusá una existente (`emailQueue`, `notificationsQueue`) o creá `export const xxxQueue = new Queue("xxx", { connection })`.
-4. **Encolá desde el service** (`lib/services/*`), no desde el componente/route. Seguí el patrón de
-   `emailBookingDetails`: guardar contra datos faltantes → `queue.add(name, toXxxPayload(...))` dentro de
-   try/catch → devolver `ServiceResult`. El encolado es fire-and-forget respecto del happy path.
-5. **`tsc` + `lint`** verde.
+1. **Agregá el `OutboxEventType`** en `lib/types/outbox.ts`.
+2. **Escribí la fila en la misma transacción** que la entidad, con el CTE del repo correspondiente
+   (`createBookingRecord` / `updateBooking` / `createUser` son los modelos). Payload thin: sólo ids.
+3. **`tsc` + `lint`** verde.
 
-### En el worker (repo aparte)
+### En el worker
 
-1. **Replicá el `type XxxPayload`** exactamente igual (copiá el bloque de `lib/events.ts` del producer a `src/events.ts`).
-2. **Nuevo handler** `async function processXxx(job)`: castea `job.data as XxxPayload` y hace el trabajo.
-   Si algo falla, dejá que el error propague — `createProcessor` lo loguea y lo re-lanza para que BullMQ reintente.
-3. **Registrá el caso** agregándolo al job map que la cola le pasa a `createProcessor` (`{ "xxx": processXxx }`).
-4. Si es cola nueva: nuevo `new Worker("xxx", createProcessor("xxxProcessor", { ... }), { autorun: false })` y arrancala en el bootstrap (`src/index.ts`).
-5. **`tsc`** verde y el email/efecto renderiza/ocurre igual.
+1. **Definí el `type XxxPayload`** en `src/events.ts`, con `processorKey: "xxx"` literal, mínimo y
+   JSON-safe (fechas ISO).
+2. **Enseñale el evento a `toJobs`** (`src/outbox/fan-out.ts`): rehidratá lo que el payload necesita y
+   devolvé el `QueuedJob` con su `jobId` determinístico. Si el agregado no está, `null`.
+3. **Nuevo handler** `async function processXxx(job)`: castea `job.data as XxxPayload` y hace el trabajo.
+   Si algo falla, dejá que el error propague — `createProcessor` lo loguea y lo re-lanza.
+4. **Registrá el caso** en el job map de la cola (`{ "xxx": processXxx }`).
+5. Si es cola nueva: agregala a `src/redis/queues.ts`, creá su `Worker` en `src/redis/workers.ts`,
+   sumala al map `queues` del relay y arrancala en `src/index.ts`.
+6. **`tsc`** verde y el efecto ocurre igual.
 
 ---
 
 ## Idempotencia — `jobId` determinístico
 
-BullMQ es *at-least-once*: garantiza que el job se procese **al menos** una vez, no exactamente una.
-Con los reintentos activos, el productor tiene que asumir que puede encolar el mismo hecho dos veces.
+BullMQ es *at-least-once*, y el relay le suma su propia ventana: puede publicar y morir antes de marcar
+`published_at`, con lo cual el próximo tick republica. El productor tiene que asumir que va a encolar el
+mismo hecho dos veces.
 
 La herramienta es un `jobId` derivado del evento de dominio. **La clave identifica el hecho, no la
-invocación:**
+invocación** (`src/outbox/fan-out.ts`):
 
 ```ts
-// La reserva + la etapa del ciclo de vida.
-await emailQueue.add("emails", payload, { jobId: `booking-${booking.id}-${type}` });
-
-// Sin etapa que desambiguar: el id del usuario alcanza.
-await emailQueue.add("emails", payload, { jobId: `greet-${user.id}` });
+{ jobId: `booking-${booking.id}-${spec.email}` }        // reserva + etapa del ciclo de vida
+{ jobId: `notification-${booking.id}-${spec.email}` }
+{ jobId: `greet-${user.id}` }                            // sin etapa que desambiguar
 ```
 
-`type` **tiene que ir en la clave**. Una misma reserva emite `pending`, `approved` y `cancelled`, y
-son mails distintos que sí deben salir todos; una clave sin `type` los colapsaría en uno.
+La etapa **tiene que ir en la clave**. Una misma reserva emite `pending`, `approved` y `cancelled`, y
+son mails distintos que sí deben salir todos; una clave sin ella los colapsaría en uno.
 
 ### Las dos cotas que hay que tener presentes
 
@@ -234,23 +216,9 @@ idempotencia del efecto.
 
 ---
 
-## Regla del contrato espejo
-
-Los `*Payload` existen **duplicados a propósito** en los dos repos (no hay paquete compartido). Cuando
-cambie un contrato:
-
-- [ ] Actualizar `type` **y** mapper en el producer (`lib/events.ts`).
-- [ ] Actualizar el `type` replicado en el worker (`src/events.ts`).
-- [ ] Actualizar este doc si cambió una convención.
-- [ ] `tsc` verde en **ambos** repos.
-
-Al agregar/quitar un campo, pensá la compatibilidad: si hay jobs viejos encolados en Redis, el worker
-nuevo tiene que tolerar payloads sin el campo nuevo (campos opcionales o defaults).
-
----
-
 ## Checklist rápido
 
-**Payload:** mínimo · JSON-safe · fechas ISO · sin secretos · `processorKey` literal · un tipo + un mapper.
-**Producer:** contrato en `lib/events.ts` · encolar desde el service con guard + try/catch.
-**Worker:** type replicado · handler + caso en el job map de la cola · sin secretos que loguear.
+**Fila de outbox:** thin (sólo ids) · en la misma transacción que la entidad · `event_type` en `lib/types/outbox.ts`.
+**Payload:** mínimo · JSON-safe · fechas ISO · sin secretos · `processorKey` literal.
+**Relay:** el `case` en `toJobs` · `jobId` determinístico · `null` si el agregado no está.
+**Consumer:** handler + caso en el job map de la cola · sin secretos que loguear.
