@@ -2,6 +2,7 @@ import "dotenv/config.js";
 import { emailsWorker, notificationsWorker } from "./redis/workers.js";
 import { pubClient } from "./redis/client.js";
 import { io as chatServer } from "./redis/socket.js";
+import { relay } from "./relay.js";
 
 // node-redis emits `error` events; without a listener they throw and can crash
 // the process. Attach before anything connects.
@@ -23,6 +24,8 @@ async function initialize() {
   console.info("[pubClient]: initialized");
   chatServer.listen(socketPort);
   console.info(`[chatServer]: listening on ${socketPort}`);
+  relay.start();
+  console.info("[relay]: initialized");
 
   // run() starts each processing loop; its promise resolves only when the
   // worker closes, so we start them without awaiting.
@@ -44,6 +47,7 @@ async function shutdown() {
   await emailsWorker.close();
   await notificationsWorker.close();
   await pubClient.close();
+  relay.stop();
   console.info("[shutdown]: connections closed");
   process.exit(0);
 }

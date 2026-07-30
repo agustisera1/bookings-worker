@@ -1,4 +1,6 @@
+import { NotifyEventType } from "@tanstack/react-query";
 import { Pool, QueryResult, QueryResultRow } from "pg";
+import { EVENTS } from "../chat/types.js";
 
 const pool = new Pool({
   user: process.env.PGUSER,
@@ -43,3 +45,20 @@ export type Booking = {
   cancelled_by: BookingParty | null;
   cancelled_at: string | null;
 };
+
+export type Outbox = {
+  id: string;
+  aggregate_type: string;
+  aggregate_id: string;
+  event_type: string; // Check to match with real events type
+  payload: Record<string, unknown>;
+  created_at: string;
+  published_at: string | null;
+};
+
+export type NotificationType =
+  | "pending"
+  | "approved"
+  | "rejected"
+  | "updated"
+  | "cancelled";
