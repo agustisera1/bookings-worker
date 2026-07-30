@@ -169,11 +169,13 @@ Familia distinta con distinto perfil de retry/concurrencia (ej. sync a Elasticse
 ### En el worker
 
 1. **Definí el `type XxxPayload`** en `src/events.ts`, con `processorKey: "xxx"` literal, mínimo y
-   JSON-safe (fechas ISO).
+   JSON-safe (fechas ISO). Intersecalo con `Claimable` para que lleve el `eventId`.
 2. **Enseñale el evento a `toJobs`** (`src/outbox/fan-out.ts`): rehidratá lo que el payload necesita y
-   devolvé el `QueuedJob` con su `jobId` determinístico. Si el agregado no está, `null`.
-3. **Nuevo handler** `async function processXxx(job)`: castea `job.data as XxxPayload` y hace el trabajo.
-   Si algo falla, dejá que el error propague — `createProcessor` lo loguea y lo re-lanza.
+   devolvé el `QueuedJob` con su `jobId` determinístico y el `eventId` del outbox en `data`. Si el
+   agregado no está, `null`.
+3. **Nuevo handler** `async function processXxx(job)`: castea `job.data as XxxPayload`, **claimea el
+   efecto** (ver Idempotencia) y hace el trabajo. Si algo falla, dejá que el error propague —
+   `createProcessor` lo loguea y lo re-lanza.
 4. **Registrá el caso** en el job map de la cola (`{ "xxx": processXxx }`).
 5. Si es cola nueva: agregala a `src/redis/queues.ts`, creá su `Worker` en `src/redis/workers.ts`,
    sumala al map `queues` del relay y arrancala en `src/index.ts`.
@@ -181,14 +183,18 @@ Familia distinta con distinto perfil de retry/concurrencia (ej. sync a Elasticse
 
 ---
 
-## Idempotencia — `jobId` determinístico
+## Idempotencia — dos capas
 
 BullMQ es *at-least-once*, y el relay le suma su propia ventana: puede publicar y morir antes de marcar
-`published_at`, con lo cual el próximo tick republica. El productor tiene que asumir que va a encolar el
-mismo hecho dos veces.
+`published_at`, con lo cual el próximo tick republica. Nadie puede asumir que un hecho se encola —ni que
+un job corre— una sola vez.
 
-La herramienta es un `jobId` derivado del evento de dominio. **La clave identifica el hecho, no la
-invocación** (`src/outbox/fan-out.ts`):
+Se cubre en dos lugares, y **cada uno tapa una mitad distinta**.
+
+### 1. Productor — `jobId` determinístico
+
+Un `jobId` derivado del evento de dominio. **La clave identifica el hecho, no la invocación**
+(`src/outbox/fan-out.ts`):
 
 ```ts
 { jobId: `booking-${booking.id}-${spec.email}` }        // reserva + etapa del ciclo de vida
@@ -199,26 +205,48 @@ invocación** (`src/outbox/fan-out.ts`):
 La etapa **tiene que ir en la clave**. Una misma reserva emite `pending`, `approved` y `cancelled`, y
 son mails distintos que sí deben salir todos; una clave sin ella los colapsaría en uno.
 
-### Las dos cotas que hay que tener presentes
+Dos cotas: la ventana de dedup es la **retención**, no "para siempre" (con `removeOnComplete: 1000`, a
+los mil jobs completados el mismo id vuelve a entrar — es volumen, no tiempo); y protege el **encolado,
+no el envío**, porque `attempts` reintenta *ese mismo job* sin pasar por el `jobId`.
 
-**1. La ventana de dedup es la retención, no "para siempre".** BullMQ solo puede descartar un `jobId`
-repetido mientras ese job **siga en Redis**. Con `removeOnComplete: 1000`, pasados 1000 jobs
-completados el mismo id vuelve a entrar. Es una ventana de volumen, no de tiempo: cuanto más tráfico,
-más corta. Si hiciera falta una garantía real de "una sola vez", el dedup tendría que salir de la cola
-y pasar a una tabla de efectos ya aplicados.
+### 2. Consumer — claim del efecto
 
-**2. Protege el encolado, no el envío.** `attempts` reintenta **ese mismo job**; no encola uno nuevo,
-así que el `jobId` no interviene. La dedup evita el **doble encolado**; el doble envío dentro de un
-mismo job (Resend mandó, la respuesta se perdió, el handler tiró) es otro problema y necesitaría
-idempotencia del efecto.
+Lo que la capa anterior no cubre: el job que ya corrió, mandó el mail y murió antes del ack. BullMQ lo
+reintenta y el `jobId` no interviene.
 
-> Esa distinción es la más fácil de pasar por alto: `jobId` resuelve el productor, no el consumer.
+La clave viaja en el payload como `eventId` — el id de la fila de `outbox`, que el relay pone en cada
+job. Es la misma en todos los reintentos porque la emite el productor, no el worker.
+
+Cómo se claimea depende de **qué es el efecto**:
+
+| Efecto | Guard | Ref |
+|---|---|---|
+| Externo (mandar un mail) | fila en `processed_events`, PK `(event_id, consumer)`, insertada **antes** del envío | `src/processors/email.ts` |
+| Escritura a la propia DB (notificación in-app) | unique index sobre `notifications.event_id`: el insert **es** el claim | `src/mongo/notifications.mongo.ts` |
+
+Cuando el efecto ya es una escritura no hace falta ledger aparte: la constraint del motor es a la vez
+el chequeo y la marca, en una sola operación atómica. El ledger existe sólo para los efectos que
+ocurren fuera de la base.
+
+La PK es **compuesta** porque una fila del outbox fanea a varias colas: con `event_id` solo, el primer
+consumer en claimear dejaría afuera a los demás efectos del mismo evento.
+
+**El orden es claim y después efecto.** Al revés, dos ejecuciones en paralelo mandan las dos antes de
+que ninguna llegue a anotar.
+
+> Con un efecto externo no existe exactly-once: Resend no participa de la transacción. Lo que se
+> construye es at-least-once en la entrega **+** dedup en el consumer, y el resultado observable es
+> "una sola vez".
+
+**Abierto:** si el envío falla *después* del claim, el reintento encuentra la fila puesta y no manda
+nada. Hoy `processed_events` es booleano (existe = procesado); cubrir ese caso pide estado
+(`pending`/`sent`) y una política para liberar claims viejos.
 
 ---
 
 ## Checklist rápido
 
 **Fila de outbox:** thin (sólo ids) · en la misma transacción que la entidad · `event_type` en `lib/types/outbox.ts`.
-**Payload:** mínimo · JSON-safe · fechas ISO · sin secretos · `processorKey` literal.
+**Payload:** mínimo · JSON-safe · fechas ISO · sin secretos · `processorKey` literal · `eventId`.
 **Relay:** el `case` en `toJobs` · `jobId` determinístico · `null` si el agregado no está.
 **Consumer:** handler + caso en el job map de la cola · sin secretos que loguear.

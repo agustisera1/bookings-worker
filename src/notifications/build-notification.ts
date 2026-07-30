@@ -17,6 +17,7 @@ export function buildNotification(
 ): NotificationDocumentPayload {
   const content = notificationContent[payload.type];
   return {
+    event_id: payload.eventId,
     listing_id: listing._id, // The listing linked from listingsDb.listings
     host_id: listing.host_id,
     guest_id: payload.userId, // The user the notification is about

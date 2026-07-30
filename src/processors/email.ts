@@ -8,6 +8,7 @@ import {
 import { bookingEmailHtml } from "../templates/booking-email.js";
 import { greetingEmailHtml } from "../templates/greeting-email.js";
 import { createProcessor } from "./dispatch.js";
+import * as eventsRepo from "../pg/events.pg.js";
 
 const devMode = Number(process.env.DEV_MODE) === 1;
 
@@ -37,6 +38,15 @@ async function sendEmail(
 async function greetUser(job: Job) {
   const payload = job.data as GreetingPayload;
 
+  const claimed = await eventsRepo.insertEvent(
+    payload.eventId,
+    payload.processorKey,
+  );
+  if (!claimed) {
+    console.info("[greetUser]: already sent for", payload.eventId);
+    return;
+  }
+
   await sendEmail("greetUser", {
     from: emailFrom,
     to: devMode ? devEmailTo : [payload.email], // Just signed up email
@@ -64,6 +74,15 @@ function getEmailNotificationPayload(data: BookingPayload) {
 // copy (pending / approved / rejected / updated).
 async function notifyBooking(job: Job) {
   const payload = job.data as BookingPayload;
+
+  const claimed = await eventsRepo.insertEvent(
+    payload.eventId,
+    payload.processorKey,
+  );
+  if (!claimed) {
+    console.info("[notifyBooking]: already sent for", payload.eventId);
+    return;
+  }
 
   await sendEmail("notifyBooking", {
     from: emailFrom,

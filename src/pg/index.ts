@@ -1,6 +1,4 @@
-import { NotifyEventType } from "@tanstack/react-query";
 import { Pool, QueryResult, QueryResultRow } from "pg";
-import { EVENTS } from "../chat/types.js";
 
 const pool = new Pool({
   user: process.env.PGUSER,
@@ -15,6 +13,12 @@ export const query = <R extends QueryResultRow = QueryResultRow>(
   params: unknown[],
 ): Promise<QueryResult<R>> => {
   return pool.query<R>(text, params);
+};
+
+export type PgProcessedEvent = {
+  event_id: string; //PK
+  consumer: string; //PK
+  processed_at: string;
 };
 
 export type PgUser = {
