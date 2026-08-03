@@ -4,6 +4,10 @@
 // the full domain entities. The contract is replicated by hand across the two
 // repos, so keep these in sync with the API side.
 
+// El id de la fila de `outbox` que originó el job, y la idempotency key de todo
+// consumer: la emite el relay, así que sobrevive a los reintentos de BullMQ.
+type Claimable = { eventId: string };
+
 export type ListingLocation = {
   address?: string;
   city?: string;
@@ -47,7 +51,7 @@ export type NotificationType =
 
 // Mirrors NotificationJobPayload enqueued by the API (lib/events.ts). Minimal:
 // only the ids the worker rehydrates from, plus the discriminant `type`.
-export type NotificationJobPayload = {
+export type NotificationJobPayload = Claimable & {
   processorKey: "send-notification";
   type: InAppNotificationType;
   listingId: string;
@@ -58,7 +62,7 @@ export type NotificationJobPayload = {
 // Mirrors BookingEmailPayload enqueued by the API: only the fields the email
 // template renders, not the full domain entities. `type` selects the lifecycle
 // copy — a single processorKey covers every booking email.
-export type BookingPayload = {
+export type BookingPayload = Claimable & {
   processorKey: "notify-booking";
   type: NotificationType;
   guest: { email: string };
@@ -69,7 +73,7 @@ export type BookingPayload = {
 
 // Mirrors WelcomeEmailPayload enqueued by the API (lib/events.ts). Minimal: the
 // welcome template only greets by email, so that's the sole field on the wire.
-export type GreetingPayload = {
+export type GreetingPayload = Claimable & {
   processorKey: "greet-user";
   email: string;
 };

@@ -69,6 +69,7 @@ function toEmailBooking(booking: Booking): BookingPayload["booking"] {
 // The outbox row carries ids only, so everything the payloads render is read
 // back here — the write path never paid for these lookups.
 async function bookingEvent(
+  eventId: string,
   bookingId: string,
   spec: BookingEventSpec,
 ): Promise<QueuedJob[] | null> {
@@ -96,6 +97,7 @@ async function bookingEvent(
     {
       queue: "notifications",
       data: {
+        eventId,
         processorKey: "send-notification",
         type: spec.notify,
         listingId: listing._id,
@@ -109,6 +111,7 @@ async function bookingEvent(
     {
       queue: "emails",
       data: {
+        eventId,
         processorKey: "notify-booking",
         type: spec.email,
         guest: { email: guest.email },
@@ -128,14 +131,17 @@ async function bookingEvent(
   ];
 }
 
-async function userRegistered(userId: string): Promise<QueuedJob[] | null> {
+async function userRegistered(
+  eventId: string,
+  userId: string,
+): Promise<QueuedJob[] | null> {
   const user = await findUserById(userId);
   if (!user) return null;
 
   return [
     {
       queue: "emails",
-      data: { processorKey: "greet-user", email: user.email },
+      data: { eventId, processorKey: "greet-user", email: user.email },
       opts: { jobId: `greet-${user.id}` },
     },
   ];
@@ -150,7 +156,7 @@ async function userRegistered(userId: string): Promise<QueuedJob[] | null> {
  */
 export async function toJobs(event: Outbox): Promise<QueuedJob[] | null> {
   if (event.event_type === "user.registered") {
-    return userRegistered(event.aggregate_id);
+    return userRegistered(event.id, event.aggregate_id);
   }
 
   const spec: BookingEventSpec | undefined =
@@ -161,5 +167,5 @@ export async function toJobs(event: Outbox): Promise<QueuedJob[] | null> {
     return null;
   }
 
-  return bookingEvent(event.aggregate_id, spec);
+  return bookingEvent(event.id, event.aggregate_id, spec);
 }

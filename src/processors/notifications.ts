@@ -24,9 +24,13 @@ async function sendNotification(job: Job) {
   // Persist first (Mongo is the source of truth), then fan out. If the insert
   // fails we never publish, so a live client can't receive an event the DB
   // lacks — on refetch it would just vanish.
+  //
+  // El insert es también el claim: `false` es un reintento de un job ya
+  // procesado, y republicar le duplicaría la notificación al cliente conectado.
   const inserted = await insertNotification(notification);
   if (!inserted) {
-    throw new Error("[sendNotification]: Failed to persist notification");
+    console.info("[sendNotification]: already stored for", payload.eventId);
+    return;
   }
 
   await publish(

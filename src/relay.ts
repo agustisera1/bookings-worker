@@ -65,7 +65,6 @@ class Relay {
   }
 
   pollEvents = async () => {
-    console.log("poll called", this.events);
     try {
       const pending = await outboxRepo.findPendingEvents();
       this.events = pending;
