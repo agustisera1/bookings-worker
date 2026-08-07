@@ -1,9 +1,9 @@
 import type { JobsOptions } from "bullmq";
 import type {
   BookingPayload,
-  GreetingPayload,
+  EmailJob,
   InAppNotificationType,
-  NotificationJobPayload,
+  NotificationJob,
   NotificationType,
 } from "../events.js";
 import type { Booking, Outbox } from "../pg/index.js";
@@ -15,8 +15,8 @@ import { findListingById } from "../mongo/listings.mongo.js";
 // The relay is what resolves `queue` to the real BullMQ Queue — keeping this
 // module free of Redis is what makes the fan-out testable without a connection.
 export type QueuedJob =
-  | { queue: "emails"; data: BookingPayload | GreetingPayload; opts: JobsOptions }
-  | { queue: "notifications"; data: NotificationJobPayload; opts: JobsOptions };
+  | { queue: "emails"; data: EmailJob; opts: JobsOptions }
+  | { queue: "notifications"; data: NotificationJob; opts: JobsOptions };
 
 // What each booking transition announces. `recipient` is who the in-app
 // notification is for — always the party that did NOT act, since the actor
@@ -131,6 +131,23 @@ async function bookingEvent(
   ];
 }
 
+// Segundo nivel del agregado `booking`: el verbo sale de la tabla de arriba.
+async function getBookingJob(event: Outbox): Promise<QueuedJob[] | null> {
+  const spec: BookingEventSpec | undefined =
+    BOOKING_EVENTS[event.event_type as keyof typeof BOOKING_EVENTS];
+
+  if (!spec) {
+    console.error(
+      "[getBookingJob]: unknown event_type",
+      event.event_type,
+      event.id,
+    );
+    return null;
+  }
+
+  return bookingEvent(event.id, event.aggregate_id, spec);
+}
+
 async function userRegistered(
   eventId: string,
   userId: string,
@@ -147,25 +164,38 @@ async function userRegistered(
   ];
 }
 
+// Segundo nivel del agregado `user`: un `case` por verbo.
+async function getUserJob(event: Outbox): Promise<QueuedJob[] | null> {
+  switch (event.event_type) {
+    case "user.registered":
+      return userRegistered(event.id, event.aggregate_id);
+    default:
+      console.error(
+        "[getUserJob]: unknown event_type",
+        event.event_type,
+        event.id,
+      );
+      return null;
+  }
+}
+
 /**
  * Turns an outbox row into the jobs it fans out to.
+ *
+ * Primer nivel: el `event_type` es `<agregado>.<verbo>`, así que el prefijo elige
+ * el resolver y cada resolver se ocupa de sus propios verbos.
  *
  * `null` means the row can never be published — unknown event type, or its
  * aggregate is gone — so the relay drops it. Without that distinction a single
  * unrehydratable row is retried on every tick, forever.
  */
 export async function toJobs(event: Outbox): Promise<QueuedJob[] | null> {
-  if (event.event_type === "user.registered") {
-    return userRegistered(event.id, event.aggregate_id);
-  }
+  const isUserEvent = event.event_type.startsWith("user.");
+  const isBookingEvent = event.event_type.startsWith("booking.");
 
-  const spec: BookingEventSpec | undefined =
-    BOOKING_EVENTS[event.event_type as keyof typeof BOOKING_EVENTS];
+  if (isUserEvent) return getUserJob(event);
+  if (isBookingEvent) return getBookingJob(event);
 
-  if (!spec) {
-    console.error("[toJobs]: unknown event_type", event.event_type, event.id);
-    return null;
-  }
-
-  return bookingEvent(event.id, event.aggregate_id, spec);
+  console.error("[toJobs]: unknown aggregate", event.event_type, event.id);
+  return null;
 }

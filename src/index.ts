@@ -7,10 +7,16 @@ import { relay } from "./relay.js";
 // node-redis emits `error` events; without a listener they throw and can crash
 // the process. Attach before anything connects.
 pubClient.on("error", (err) => console.error("[pubClient]:", err));
-emailsWorker.on("error", (err) => console.error("[emailsWorker]:", err));
-notificationsWorker.on("error", (err) =>
-  console.error("[notificationsWorker]:", err),
-);
+
+// Un solo lugar para los fallos de todas las colas. `failed` cubre además lo que
+// ningún handler llega a ver: payload sin handler, job stalled, timeout.
+for (const worker of [emailsWorker, notificationsWorker]) {
+  const label = `[${worker.name}Worker]`;
+  worker.on("error", (err) => console.error(label, err));
+  worker.on("failed", (job, err) =>
+    console.error(label, job?.name, "failed with error", err),
+  );
+}
 
 // Startup order matters: the notifications processor publishes on `pubClient`,
 // so that connection must be up before the workers start pulling jobs. The

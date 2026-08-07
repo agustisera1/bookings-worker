@@ -74,12 +74,14 @@ Un payload cruza un boundary de proceso y se **serializa a JSON** en Redis. Por 
 ### `processorKey` — ruteo dentro de una cola
 
 Una cola transporta **varios tipos de job**. El discriminante es `processorKey` dentro del payload; el
-worker rutea con un **job map** (`Record<processorKey, handler>`) sobre ese campo. El nombre de job de
-BullMQ (`queue.add(name, data)`) **no** se usa para rutear.
+processor de la cola rutea con un `switch` sobre ese campo. El nombre de job de BullMQ
+(`queue.add(name, data)`) **no** se usa para rutear.
 
-`processorKey` se tipa como **literal** (`"notify-booking"`), no como `string`, para que el job map se
-indexe por esos literales; si llega un `processorKey` sin handler, el dispatcher tira (y BullMQ
-reintenta).
+`processorKey` se tipa como **literal** (`"notify-booking"`), no como `string`, y eso es lo que hace
+funcionar todo lo demás: los jobs de una cola se juntan en una **unión discriminada** (`EmailJob`,
+`NotificationJob` en `src/events.ts`), el `switch` narrowea el payload dentro de cada `case` —el handler
+recibe su tipo exacto, sin castear— y el `default` lo asigna a `never`, así que **un job sin su `case` no
+compila**. Si igual llegara uno desconocido por la cola, tira (y BullMQ reintenta).
 
 **`processorKey` vs. una variación del mismo trabajo.** El `processorKey` distingue *trabajos distintos*
 (mandar un mail vs. sincronizar a Elasticsearch). Variaciones del **mismo** trabajo — misma plantilla,
@@ -106,23 +108,31 @@ await bookingsRepo.updateBooking(
 ```
 
 Los `OutboxEventType` válidos viven en `lib/types/outbox.ts`. **Agregar uno obliga a enseñárselo al
-`toJobs` del worker**: un tipo que no conoce se descarta con un log.
+resolver de su agregado en el worker**: un tipo que no conoce se descarta con un log.
 
 ### Worker — el fan-out (`src/outbox/fan-out.ts`)
 
 Un evento de dominio se abre en N jobs. Como la fila es thin, acá se rehidrata todo lo que los payloads
-renderizan:
+renderizan. El ruteo tiene **dos niveles**, porque un `event_type` es `<agregado>.<verbo>`: el prefijo
+elige el resolver del agregado, y cada resolver se ocupa de sus propios verbos.
 
 ```ts
+// `null` = la fila no se va a poder publicar nunca (tipo desconocido, o el agregado ya no está).
+// El relay la marca igual: sin eso, una fila podrida se reintenta en cada tick para siempre.
+export async function toJobs(event: Outbox): Promise<QueuedJob[] | null> {
+  const isUserEvent = event.event_type.startsWith("user.");
+  const isBookingEvent = event.event_type.startsWith("booking.");
+
+  if (isUserEvent) return getUserJob(event);       // 2º nivel: switch por verbo
+  if (isBookingEvent) return getBookingJob(event); // 2º nivel: tabla BOOKING_EVENTS
+  // …
+}
+
 const BOOKING_EVENTS = {
   "booking.created":  { email: "pending",  notify: "notify_user",           recipient: "host" },
   "booking.accepted": { email: "approved", notify: "notify_booking_update", recipient: "guest" },
   // …
 };
-
-// `null` = la fila no se va a poder publicar nunca (tipo desconocido, o el agregado ya no está).
-// El relay la marca igual: sin eso, una fila podrida se reintenta en cada tick para siempre.
-export async function toJobs(event: Outbox): Promise<QueuedJob[] | null>;
 ```
 
 ### Worker — el relay (`src/relay.ts`)
@@ -139,17 +149,32 @@ BullMQ ya persistió el job y se hace cargo de reintentarlo.
 
 ### Worker — el consumer
 
-```ts
-// Un Worker por cola. `createProcessor` (src/processors/dispatch.ts) busca el handler por
-// processorKey; si no existe —o si el handler tira— re-lanza para que BullMQ reintente.
-// Los workers se crean con `autorun: false` y se arrancan en el bootstrap (src/index.ts).
-export const emailsWorker = new Worker("emails", emailsProcessor, { connection, autorun: false });
+Un Worker por cola, creado con `autorun: false` y arrancado en el bootstrap (`src/index.ts`), que ahí
+mismo centraliza el log de fallos (`worker.on("failed")`). El processor es **el índice de la cola y nada
+más**: un `case` por `processorKey`, y el trabajo vive en el archivo de su evento.
 
-const emailsProcessor = createProcessor("emailsProcessor", {
-  "greet-user": greetUser,
-  "notify-booking": notifyBooking,
-});
+```ts
+// src/processors/emails.ts
+export async function emailsProcessor(job: Job) {
+  const payload = job.data as EmailJob;
+
+  switch (payload.processorKey) {
+    case "notify-booking":
+      return notifyBooking(payload); // llega como BookingPayload, ya narrowed
+    case "greet-user":
+      return greetUser(payload);
+    default: {
+      const unhandled: never = payload; // un `case` que falte rompe acá
+      void unhandled;
+      throw new Error(`[emailsProcessor]: unknown processorKey ${job.data.processorKey}`);
+    }
+  }
+}
 ```
+
+> **Mientras una cola transporta un solo tipo de job** (hoy `notifications`), TS **no** reduce `payload`
+> a `never` en el `default`: con una unión de un miembro el que narrowea es el discriminante
+> (`payload.processorKey`). Con dos o más es al revés. Ref: `src/processors/notifications.ts`.
 
 ---
 
@@ -169,16 +194,19 @@ Familia distinta con distinto perfil de retry/concurrencia (ej. sync a Elasticse
 ### En el worker
 
 1. **Definí el `type XxxPayload`** en `src/events.ts`, con `processorKey: "xxx"` literal, mínimo y
-   JSON-safe (fechas ISO). Intersecalo con `Claimable` para que lleve el `eventId`.
-2. **Enseñale el evento a `toJobs`** (`src/outbox/fan-out.ts`): rehidratá lo que el payload necesita y
-   devolvé el `QueuedJob` con su `jobId` determinístico y el `eventId` del outbox en `data`. Si el
-   agregado no está, `null`.
-3. **Nuevo handler** `async function processXxx(job)`: castea `job.data as XxxPayload`, **claimea el
-   efecto** (ver Idempotencia) y hace el trabajo. Si algo falla, dejá que el error propague —
-   `createProcessor` lo loguea y lo re-lanza.
-4. **Registrá el caso** en el job map de la cola (`{ "xxx": processXxx }`).
-5. Si es cola nueva: agregala a `src/redis/queues.ts`, creá su `Worker` en `src/redis/workers.ts`,
-   sumala al map `queues` del relay y arrancala en `src/index.ts`.
+   JSON-safe (fechas ISO). Intersecalo con `Claimable` para que lleve el `eventId`, y **sumalo a la
+   unión de su cola** (`EmailJob` / `NotificationJob`). Desde ahí, `tsc` te va marcando lo que falta.
+2. **Enseñale el evento al resolver de su agregado** (`getUserJob` / `getBookingJob` en
+   `src/outbox/fan-out.ts`); si el agregado es nuevo, sumale su resolver y su rama en `toJobs`.
+   Rehidratá lo que el payload necesita y devolvé el `QueuedJob` con su `jobId` determinístico y el
+   `eventId` del outbox en `data`. Si el agregado no está, `null`.
+3. **Un archivo para el evento**, `src/<cola>/<evento>.ts`, con todo lo suyo: su copy/template, su
+   builder puro si hace falta, y el handler `async function processXxx(payload: XxxPayload)` — recibe el
+   payload **ya tipado**, no el `Job`. Adentro: **claimeá el efecto** (ver Idempotencia) y hacé el
+   trabajo. Si algo falla, dejá que el error propague: BullMQ reintenta y el fallo se loguea solo.
+4. **Agregá su `case`** al switch del processor de la cola (`src/processors/<cola>.ts`).
+5. Si es cola nueva: agregala a `src/redis/queues.ts`, creá su `Worker` en `src/redis/workers.ts` con su
+   processor, sumala al map `queues` del relay y al bootstrap de `src/index.ts`.
 6. **`tsc`** verde y el efecto ocurre igual.
 
 ---
@@ -221,7 +249,7 @@ Cómo se claimea depende de **qué es el efecto**:
 
 | Efecto | Guard | Ref |
 |---|---|---|
-| Externo (mandar un mail) | fila en `processed_events`, PK `(event_id, consumer)`, insertada **antes** del envío | `src/processors/email.ts` |
+| Externo (mandar un mail) | fila en `processed_events`, PK `(event_id, consumer)`, insertada **antes** del envío | `src/emails/booking.ts` |
 | Escritura a la propia DB (notificación in-app) | unique index sobre `notifications.event_id`: el insert **es** el claim | `src/mongo/notifications.mongo.ts` |
 
 Cuando el efecto ya es una escritura no hace falta ledger aparte: la constraint del motor es a la vez
@@ -248,5 +276,5 @@ nada. Hoy `processed_events` es booleano (existe = procesado); cubrir ese caso p
 
 **Fila de outbox:** thin (sólo ids) · en la misma transacción que la entidad · `event_type` en `lib/types/outbox.ts`.
 **Payload:** mínimo · JSON-safe · fechas ISO · sin secretos · `processorKey` literal · `eventId`.
-**Relay:** el `case` en `toJobs` · `jobId` determinístico · `null` si el agregado no está.
-**Consumer:** handler + caso en el job map de la cola · sin secretos que loguear.
+**Relay:** el verbo en el resolver de su agregado (`getUserJob`/`getBookingJob`) · `jobId` determinístico · `null` si el agregado no está.
+**Consumer:** un archivo por evento (`src/<cola>/<evento>.ts`) · su `case` en el switch de la cola · el payload en la unión · sin secretos que loguear.

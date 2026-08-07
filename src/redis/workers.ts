@@ -1,6 +1,6 @@
 import { Worker, createNodeRedisClient } from "bullmq";
 import { createClient } from "redis";
-import { emailsProcessor as ep } from "../processors/email.js";
+import { emailsProcessor as ep } from "../processors/emails.js";
 import { notificationsProcessor as np } from "../processors/notifications.js";
 
 const url = process.env.REDIS_URL;
