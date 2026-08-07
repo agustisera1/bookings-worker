@@ -1,8 +1,8 @@
-// Wire contracts for the jobs this worker pulls off the BullMQ queues. Each
-// *Payload mirrors the contract the API enqueues (its lib/events.ts) — the
-// worker redeclares only the minimal fields it rehydrates from or renders, not
-// the full domain entities. The contract is replicated by hand across the two
-// repos, so keep these in sync with the API side.
+// Wire contracts for the jobs this worker pulls off the BullMQ queues. Since the
+// outbox pattern the relay is the only producer, so producer and consumer both
+// live in this repo: these types are the single source, not a copy of the app's.
+// Each *Payload stays minimal — only the fields the consumer rehydrates from or
+// renders, never a full domain entity. Ver docs/architecture/BULLMQ_QUEUES.md.
 
 // El id de la fila de `outbox` que originó el job, y la idempotency key de todo
 // consumer: la emite el relay, así que sobrevive a los reintentos de BullMQ.
@@ -14,7 +14,7 @@ export type ListingLocation = {
   country?: string;
 };
 
-// The two parties to a booking. Mirrors BookingParty in the API
+// The two parties to a booking. Mirrors BookingParty in the app
 // (lib/types/booking.ts).
 export type BookingParty = "guest" | "host";
 
@@ -25,16 +25,15 @@ export type Booking = {
   guests: number;
   totalPrice: number;
   statusReason?: string;
-  // Both set only on `cancelled`. `refundAmount` is what the API's cancellation
+  // Both set only on `cancelled`. `refundAmount` is what the app's cancellation
   // policy decided is owed back — the worker renders that number, it never
   // recomputes it. Re-deriving the policy here is how the two drift apart.
   refundAmount?: number;
   cancelledBy?: BookingParty;
 };
 
-// The kind of in-app notification to build. Mirrors InAppNotificationType in
-// the API (lib/events.ts). `type` selects the copy the Mongo row carries and
-// whether it lands already-read.
+// The kind of in-app notification to build. `type` selects the copy the Mongo
+// row carries and whether it lands already-read.
 export type InAppNotificationType =
   | "mark_as_read"
   | "notify_user"
@@ -49,9 +48,9 @@ export type NotificationType =
   | "updated"
   | "cancelled";
 
-// Mirrors NotificationJobPayload enqueued by the API (lib/events.ts). Minimal:
-// only the ids the worker rehydrates from, plus the discriminant `type`.
-export type NotificationJobPayload = Claimable & {
+// In-app notification for a booking transition. Minimal: only the ids the
+// worker rehydrates from, plus the discriminant `type`.
+export type BookingNotificationPayload = Claimable & {
   processorKey: "send-notification";
   type: InAppNotificationType;
   listingId: string;
@@ -59,9 +58,9 @@ export type NotificationJobPayload = Claimable & {
   userId: string;
 };
 
-// Mirrors BookingEmailPayload enqueued by the API: only the fields the email
-// template renders, not the full domain entities. `type` selects the lifecycle
-// copy — a single processorKey covers every booking email.
+// Only the fields the email template renders, not the full domain entities.
+// `type` selects the lifecycle copy — a single processorKey covers every
+// booking email.
 export type BookingPayload = Claimable & {
   processorKey: "notify-booking";
   type: NotificationType;
@@ -71,9 +70,15 @@ export type BookingPayload = Claimable & {
   listing: { title: string; location: ListingLocation };
 };
 
-// Mirrors WelcomeEmailPayload enqueued by the API (lib/events.ts). Minimal: the
-// welcome template only greets by email, so that's the sole field on the wire.
+// Minimal: the welcome template only greets by email, so that's the sole field
+// on the wire.
 export type GreetingPayload = Claimable & {
   processorKey: "greet-user";
   email: string;
 };
+
+// Todo lo que transporta cada cola, en una unión discriminada por
+// `processorKey`. El `switch` de cada processor narrowea sobre ese campo: sumar
+// un miembro acá sin agregarle su `case` no compila.
+export type EmailJob = BookingPayload | GreetingPayload;
+export type NotificationJob = BookingNotificationPayload;

@@ -57,37 +57,43 @@ No hay lint configurado.
 
 ```
 src/
-  index.ts              Bootstrap: cablea clients, gatea workers, arranca el socket server, shutdown.
-  events.ts             Contratos de cola (*Payload) — espejo del producer. NO importa nada de la app.
+  index.ts              Bootstrap: cablea clients, gatea workers, log de fallos de todas las colas, shutdown.
+  events.ts             Contratos de cola (*Payload) + la unión de jobs de cada cola (EmailJob, NotificationJob).
+  relay.ts              Productor: polling del outbox -> toJobs -> queue.add -> markAsPublished.
 
   redis/
     client.ts           Pub client + `channels` + `publish()` (fan-out de notificaciones a SSE).
+    queues.ts           Queues BullMQ (emails, notifications) + defaultJobOptions.
     workers.ts          Workers BullMQ (emails, notifications). Conexión por REDIS_URL, autorun:false.
     socket.ts           Server socket.io + redis-adapter + CORS. Cablea el handshake (io.use), los joins por ticket (JOIN_CHAT/LEAVE_CHAT) y el message flow.
 
-  processors/
-    dispatch.ts         `createProcessor`: dispatcher genérico por job map (rutea por processorKey).
-    email.ts            Job map de la cola "emails": greet-user, notify-booking.
-    notifications.ts    Job map de la cola "notifications": send-notification (persist-then-publish).
+  outbox/
+    fan-out.ts          Una fila de outbox -> los QueuedJob que dispara. Rutea por agregado (getUserJob/getBookingJob) y adentro por verbo.
+
+  processors/           El índice de cada cola: switch processorKey -> handler. Nada más.
+    emails.ts           notify-booking, greet-user.
+    notifications.ts    send-notification.
+
+  emails/               Un archivo por evento de la cola: copy + template + handler juntos.
+    booking.ts          notifyBooking + subjects + copy por tipo + HTML del mail de reserva.
+    greeting.ts         greetUser + HTML del mail de bienvenida.
+    send.ts             `sendEmail`: remitente, redirección de dev y el throw ante un rechazo de Resend.
+
+  notifications/        Ídem, para la cola de notificaciones in-app.
+    booking.ts          sendBookingNotification + copy por tipo + builder del documento (persist-then-publish).
 
   pg/
     index.ts            Pool de PostgreSQL + `query<R>()` + tipos `PgUser`, `Booking`.
     users.pg.ts         findUserById
     bookings.pg.ts      findBookingById
+    outbox.pg.ts        findPendingEvents, markAsPublished
+    events.pg.ts        insertEvent — claim de idempotencia de los efectos externos.
   mongo/
     index.ts            Cliente Mongo (promise singleton).
     listings.mongo.ts   findListingById + ListingDocument
     notifications.mongo.ts  insertNotification + NotificationDocument
     messages.mongo.ts   insertMessage + MessageDocument
     chats.mongo.ts      findChatByBookingId, upsertChatByBookingId + ChatDocument
-
-  notifications/
-    content.ts          Tabla de copy por InAppNotificationType (title/body/isRead).
-    build-notification.ts  Puro: (payload + listing) -> documento de notificación a persistir.
-
-  templates/
-    booking-email.ts    `bookingEmailHtml` — tabla de copy por tipo + HTML del mail de reserva.
-    greeting-email.ts   `greetingEmailHtml` — mail de bienvenida.
 
   chat/                 Feature socket.io partida por responsabilidad (ver "Partición por módulos").
     types.ts            ClientMessage, SocketData, AppSocket, enum `EVENTS`; re-exporta MessageDocument.
@@ -117,17 +123,18 @@ abajo:
 ```
 index.ts (bootstrap)
    ↓ arranca
-redis/ (transporte: workers BullMQ, pub client, socket server)
+redis/ (transporte: workers BullMQ, pub client, socket server) + relay.ts (productor)
    ↓ invoca
-processors/ + chat/ (orquestación: qué hacer con cada job / mensaje)
-   ↓ usan
-notifications/ + templates/ (lógica de dominio: armar documentos / HTML)
+processors/ (índice de cada cola) + chat/ (mensajes del socket)
+   ↓ rutean a
+emails/ + notifications/ (un archivo por evento: copy + builder/template + handler)
    ↓ leen/escriben vía
 pg/ + mongo/ (acceso a datos)
 ```
 
 Los **clients de infra** (`pg/index.ts`, `mongo/index.ts`, `redis/*`, `resend.ts`) no conocen dominio;
-los **processors** orquestan; el **dominio** (build-notification, content, templates) es lógica pura.
+los **processors** solo rutean; el archivo de cada evento orquesta su efecto y guarda adentro su parte
+pura (builders, tablas de copy, templates).
 
 ### 3. Repository Pattern
 
@@ -158,30 +165,45 @@ el módulo de dominio, que delega en el `update*`/`insert*` genérico del repo.
 host") vive en el processor / módulo de dominio, no en el repo. El repo solo ofrece el
 `find`/`insert`/`update` genérico.
 
-### 4. Dispatcher genérico por `processorKey` (job map, no switch)
+### 4. Ruteo por `processorKey` con un `switch` tipado
 
-`createProcessor(label, jobs)` (`processors/dispatch.ts`) es un dispatcher **genérico y compartido**:
-busca el handler en el **job map** de la cola por `job.data.processorKey`, lo ejecuta, y **re-lanza** el
-error para que BullMQ marque el job fallido y lo reintente. Cada cola pasa **su propio** map, así un
-worker solo corre los jobs que le pertenecen. Alta cohesión (cada feature declara su map) + bajo
-acoplamiento (la lógica de dispatch es una sola).
+El processor de una cola es **su índice y nada más**: un `switch` sobre `processorKey`, un `case` por
+job, y el trabajo en el archivo del evento. Los jobs de cada cola viven en una **unión discriminada**
+(`EmailJob`, `NotificationJob` en `events.ts`), así que el switch narrowea: **cada handler recibe su
+tipo exacto**, sin castear adentro.
 
 ```ts
-export const emailsProcessor = createProcessor("emailsProcessor", {
-  "greet-user": greetUser,
-  "notify-booking": notifyBooking,
-});
+// processors/emails.ts
+switch (payload.processorKey) {
+  case "notify-booking":
+    return notifyBooking(payload); // llega como BookingPayload
+  case "greet-user":
+    return greetUser(payload);
+  default: {
+    const unhandled: never = payload; // un `case` que falte rompe acá
+    ...
+  }
+}
 ```
 
-Agregar un job = agregar una entrada al map + replicar el `*Payload`. No se toca el dispatcher.
+Agregar un job = sumar su `*Payload` a la unión de la cola + su `case`. Ese `never` del `default` es el
+punto del patrón: convierte el olvido en un error de **compilación** en vez de uno de runtime.
+
+> **Sutileza de TS:** mientras una cola transporte un **solo** tipo de job, el que narrowea a `never` en
+> el `default` es el discriminante (`payload.processorKey`), no el payload. Con dos o más es al revés.
+> Ver `processors/notifications.ts` (una) y `processors/emails.ts` (dos).
 
 ### 5. Lógica pura separada de I/O
 
-La transformación de datos vive en funciones **puras, sin I/O**, y el processor hace el I/O alrededor:
+Dentro del archivo de un evento, la transformación de datos vive en funciones **puras, sin I/O**, y el
+handler hace el I/O alrededor:
 
-- `buildNotification(payload, listing)` → arma el documento; no fetchea ni persiste.
-- El processor `sendNotification` fetchea (`findUserById`, `findListingById`), llama al builder puro,
-  y recién ahí persiste + publica.
+- `buildNotification(payload, listing)` (`notifications/booking.ts`) → arma el documento; no fetchea ni
+  persiste.
+- El handler `sendBookingNotification` fetchea (`findUserById`, `findListingById`), llama al builder
+  puro, y recién ahí persiste + publica.
+- `toJobs(event)` (`outbox/fan-out.ts`) traduce una fila de outbox a jobs y **devuelve** los
+  `QueuedJob`; encolarlos es del relay. Por eso el fan-out se puede testear sin Redis.
 
 Esto hace la lógica testeable sin levantar Redis/DB y baja el acoplamiento. Es la misma regla del
 producer (lógica pura fuera del rendering/I-O).
@@ -191,8 +213,8 @@ producer (lógica pura fuera del rendering/I-O).
 - **Formatters compartidos** en un solo lugar: fechas en `dates.ts` (`formatDate`, `nightsBetween`),
   dinero/dirección en `utils.ts` (`formatMoney`, `formatAddress`). Los templates los importan, no los
   reinventan.
-- **Copy indexada por tipo con `Record<Type, ...>`** en vez de cadenas de `if/else`:
-  `notificationContent` (`notifications/content.ts`) y `notificationCopy` (`templates/booking-email.ts`).
+- **Copy indexada por tipo con `Record<Type, ...>`** en vez de cadenas de `if/else`, en el archivo de su
+  evento: `content` (`notifications/booking.ts`), `notificationCopy` y `subjects` (`emails/booking.ts`).
   Un solo `processorKey`; el campo `type` **selecciona** la copy. Agregar un `type` = agregar una fila
   a la tabla, y TypeScript exige cubrir el `Record`.
 
@@ -225,9 +247,10 @@ sea `.ts` (`import { ... } from "./events.js"`). Es obligatorio con NodeNext —
 
 ### 10. Manejo de errores en processors
 
-- Un handler que no puede completar **tira** (`throw new Error("[fn]: ...")`); `createProcessor` loguea
-  con el formato `[label]` y **re-lanza** para que BullMQ reintente. No tragar el error salvo que el
-  efecto sea best-effort (p. ej. un fallo de Resend se loguea sin frenar el job).
+- Un handler que no puede completar **tira** (`throw new Error("[fn]: ...")`). No hay wrapper que lo
+  intercepte: BullMQ marca el job fallido y lo reintenta, y el log sale del `worker.on("failed")`
+  centralizado en `index.ts` — que cubre además lo que ningún handler llega a ver (job sin `case`,
+  stalled, timeout). No tragar el error salvo que el efecto sea best-effort.
 - **Guard contra datos faltantes**: si falta el user/listing para rehidratar, tirar (el job reintenta),
   no encolar/persistir un documento roto.
 - Formato de log: `"[nombreDeLaFuncion]"` entre corchetes. **Nunca loguear secretos ni PII de más.**
@@ -238,6 +261,8 @@ sea `.ts` (`import { ... } from "./events.js"`). Es obligatorio con NodeNext —
   notificaciones publica sobre `pubClient`). Los workers se crean con `autorun: false` justo para
   gatearlos acá.
 - `worker.run()` arranca cada loop sin `await` (su promise resuelve recién al cerrar).
+- **Los listeners de `error` y `failed` de todas las colas se cablean acá**, en un solo lugar, antes de
+  que nada conecte.
 - **Shutdown**: `SIGINT`/`SIGTERM` → `worker.close()` + `pubClient.close()`. Cerrar lo que es nuestro.
 
 ### 12. Partición de una feature por módulos (chat)
@@ -270,7 +295,9 @@ El chat corre sobre **dos credenciales distintas**, y esa separación es el dise
 
 ## Checklist al agregar código
 
-- [ ] ¿Payload nuevo o cambiado? Replicarlo en **ambos** repos y seguir `docs/architecture/BULLMQ_QUEUES.md`.
+- [ ] ¿Job nuevo? Su `*Payload` en la unión de la cola (`EmailJob`/`NotificationJob`), **un archivo para
+      el evento** (`<cola>/<evento>.ts`: copy + builder + handler) y su `case` en el switch. Seguir
+      `docs/architecture/BULLMQ_QUEUES.md`.
 - [ ] ¿Acceso a datos? Va en el archivo de **esa feature** (`<feature>.pg.ts` / `<feature>.mongo.ts`),
       con prefijo `find`/`insert`/`update`/`delete`, genérico y sin lógica de negocio.
 - [ ] ¿Transformación de datos? Función pura, separada del processor que hace el I/O.

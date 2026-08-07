@@ -1,8 +1,30 @@
-import { GreetingPayload } from "../events.js";
+import type { GreetingPayload } from "../events.js";
+import * as eventsRepo from "../pg/events.pg.js";
+import { sendEmail } from "./send.js";
 
-// Welcome email sent once when a user signs up. Shares the monochrome shell of
-// the booking templates but keeps the body minimal — just a greeting.
-export function greetingEmailHtml({ email }: GreetingPayload) {
+// The welcome email, end to end: the handler the "emails" queue routes to and
+// the template it renders.
+
+export async function greetUser(payload: GreetingPayload) {
+  const claimed = await eventsRepo.insertEvent(
+    payload.eventId,
+    payload.processorKey,
+  );
+  if (!claimed) {
+    console.info("[greetUser]: already sent for", payload.eventId);
+    return;
+  }
+
+  await sendEmail("greetUser", {
+    to: payload.email, // Just signed up email
+    subject: "Welcome to bookings app!",
+    html: greetingEmailHtml(payload),
+  });
+}
+
+// Sent once when a user signs up. Shares the monochrome shell of the booking
+// template but keeps the body minimal — just a greeting.
+function greetingEmailHtml({ email }: GreetingPayload) {
   const userName = email.split("@")[0];
 
   return `<!DOCTYPE html>

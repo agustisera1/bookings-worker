@@ -1,12 +1,47 @@
-import { Booking, BookingPayload, NotificationType } from "../events.js";
+import type { Booking, BookingPayload, NotificationType } from "../events.js";
 import { formatDate, nightsBetween } from "../dates.js";
 import { formatAddress, formatMoney } from "../utils.js";
+import * as eventsRepo from "../pg/events.pg.js";
+import { sendEmail } from "./send.js";
+
+// The booking email, end to end: the handler the "emails" queue routes to, its
+// subject lines and the template it renders. Every booking email flows through
+// here; `payload.type` selects the lifecycle copy.
+
+const subjects: Record<NotificationType, string> = {
+  approved: "Reservation approved",
+  pending: "Reservation pending",
+  rejected: "Reservation rejected",
+  updated: "Reservation updated",
+  cancelled: "Reservation cancelled",
+};
+
+export async function notifyBooking(payload: BookingPayload) {
+  const claimed = await eventsRepo.insertEvent(
+    payload.eventId,
+    payload.processorKey,
+  );
+  if (!claimed) {
+    console.info("[notifyBooking]: already sent for", payload.eventId);
+    return;
+  }
+
+  await sendEmail("notifyBooking", {
+    to: payload.guest.email,
+    subject: `${subjects[payload.type]}: ${payload.listing.title}`,
+    html: bookingEmailHtml(payload, payload.type),
+  });
+}
 
 // Per-type copy. Kept intentionally simple: only the header, status pill and
 // intro paragraph change; the booking detail grid is shared across all types.
 const notificationCopy: Record<
   NotificationType,
-  { heading: string; status: string; intro: (host: string, booking: Booking) => string }
+  {
+    heading: string;
+    status: string;
+    intro: (host: string, booking: Booking) => string;
+  }
 > = {
   pending: {
     heading: "Booking Received",
@@ -34,7 +69,7 @@ const notificationCopy: Record<
   },
   // Always addressed to the guest, but the copy turns on who cancelled: a host
   // cancelling is an apology, a guest cancelling is a receipt. Says the refund
-  // amount without explaining the rule behind it — that rule lives in the API's
+  // amount without explaining the rule behind it — that rule lives in the app's
   // cancellation policy, and restating it here is how the two drift apart.
   cancelled: {
     heading: "Booking Cancelled",
@@ -53,7 +88,7 @@ const notificationCopy: Record<
   },
 };
 
-export function bookingEmailHtml(
+function bookingEmailHtml(
   { guest, booking, host, listing }: BookingPayload,
   type: NotificationType = "updated",
 ) {
@@ -65,7 +100,7 @@ export function bookingEmailHtml(
   const copy = notificationCopy[type];
 
   // Optional note explaining an approval, rejection or cancellation. Only
-  // rendered for those types, and only when the API supplied a reason.
+  // rendered for those types, and only when the app supplied a reason.
   const reasonLabel =
     type === "approved"
       ? "Note from host"
